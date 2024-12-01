@@ -27,7 +27,9 @@ public sealed class GenerateHelmChartAction(
         }
 
         var kubeObjects = kubernetesClientService.ConvertResourcesToKubeObjects(CurrentState.AllSelectedSupportedComponents, CurrentState, true);
-        await helmChartCreator.CreateHelmChart(kubeObjects, Path.Combine(CurrentState.OutputPath, "Chart"), "AspireProject", CurrentState.IncludeDashboard.GetValueOrDefault());
+        var chartFolder = CurrentState.ChartName ?? "Chart";
+        var chartName = CurrentState.ChartName ?? "AspireProject";
+        await helmChartCreator.CreateHelmChart(kubeObjects, Path.Combine(CurrentState.OutputPath, chartFolder), chartName, CurrentState.IncludeDashboard.GetValueOrDefault());
 
         return true;
     }

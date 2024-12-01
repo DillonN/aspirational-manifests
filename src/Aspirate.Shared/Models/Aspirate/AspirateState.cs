@@ -26,6 +26,10 @@ public class AspirateState :
     public string? OutputPath { get; set; }
 
     [RestorableStateProperty]
+    [JsonPropertyName("chartName")]
+    public string? ChartName { get; set; }
+
+    [RestorableStateProperty]
     [JsonPropertyName("launchProfile")]
     public string? LaunchProfile { get; set; }
 
