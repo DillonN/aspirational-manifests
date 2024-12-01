@@ -1,3 +1,6 @@
+using k8s.Models;
+using System.Xml.Linq;
+
 namespace Aspirate.Services.Implementations;
 
 public class HelmChartCreator(IFileSystem fileSystem, IKubernetesService kubernetesService, IAnsiConsole logger) : IHelmChartCreator
@@ -32,7 +35,7 @@ public class HelmChartCreator(IFileSystem fileSystem, IKubernetesService kuberne
 
     private static async Task ProcessObjects(List<object> resources, string chartPath)
     {
-        var valuesImages = new Dictionary<string, string>();
+        var values = new Dictionary<string, Dictionary<object, object>>();
 
         foreach (var resource in resources)
         {
@@ -40,7 +43,7 @@ public class HelmChartCreator(IFileSystem fileSystem, IKubernetesService kuberne
             {
                 case V1ConfigMap configMap:
                     configMap.Metadata.NamespaceProperty = null;
-                    await WriteResourceFile(KubernetesYaml.Serialize(configMap), chartPath, configMap.Metadata.Name, configMap.Kind);
+                    await HandleConfigMap(configMap, chartPath, values);
                     continue;
                 case V1Secret secret:
                     secret.Metadata.NamespaceProperty = null;
@@ -48,11 +51,11 @@ public class HelmChartCreator(IFileSystem fileSystem, IKubernetesService kuberne
                     continue;
                 case V1Deployment deployment:
                     deployment.Metadata.NamespaceProperty = null;
-                    await HandleDeployment(deployment, chartPath, valuesImages);
+                    await HandleDeployment(deployment, chartPath, values);
                     continue;
                 case V1StatefulSet statefulSet:
                     statefulSet.Metadata.NamespaceProperty = null;
-                    await HandleStatefulSet(statefulSet, chartPath, valuesImages);
+                    await HandleStatefulSet(statefulSet, chartPath, values);
                     continue;
                 case V1Service service:
                     service.Metadata.NamespaceProperty = null;
@@ -61,34 +64,81 @@ public class HelmChartCreator(IFileSystem fileSystem, IKubernetesService kuberne
             }
         }
 
-        var values = new Dictionary<object, object>
-        {
-            ["images"] = valuesImages,
-        };
-
         await CreateValuesFile(values, chartPath);
     }
 
-    private static Task HandleStatefulSet(V1StatefulSet statefulSet, string chartPath, Dictionary<string, string> valuesImages)
+    private static Task HandleConfigMap(V1ConfigMap configMap, string chartPath, Dictionary<string, Dictionary<object, object>> values)
+    {
+        var metadata = configMap.Metadata;
+        var name = metadata.Name;
+        var kind = configMap.Kind;
+        var formattedName = FormatKebabToCamel(name);
+
+        if (!values.TryGetValue(formattedName, out var resourceValues))
+        {
+            resourceValues = [];
+            values[formattedName] = resourceValues;
+        }
+
+        if (!resourceValues.TryGetValue("env", out var envValuesObj) ||
+            envValuesObj is not Dictionary<string, string> envValues)
+        {
+            envValues = [];
+            resourceValues["env"] = envValues;
+        }
+
+        var newData = new Dictionary<string, string>(configMap.Data.Count);
+
+        foreach (var (key, value) in configMap.Data)
+        {
+            envValues[key] = value;
+
+            newData[key] = $"{{{{ .Values.{formattedName}.env.{key} | default .Values.global.env.{key} }}}}";
+        }
+
+        if (envValues.Count == 0)
+        {
+            resourceValues.Remove("env");
+        }
+
+        if (resourceValues.Count == 0)
+        {
+            values.Remove(formattedName);
+        }
+
+        configMap.Data = newData;
+
+        var udpatedResource = KubernetesYaml.Serialize(configMap);
+
+        return WriteResourceFile(udpatedResource, chartPath, name, kind);
+    }
+
+    private static Task HandleStatefulSet(
+        V1StatefulSet statefulSet,
+        string chartPath,
+        Dictionary<string, Dictionary<object, object>> values)
     {
         var metadata = statefulSet.Metadata;
         var name = metadata.Name;
         var kind = statefulSet.Kind;
 
-        PopulateValuesImages(statefulSet.Spec.Template.Spec.Containers, valuesImages, name);
+        PopulateValuesImages(statefulSet.Spec.Template.Spec.Containers, values, name);
 
         var updatedResource = KubernetesYaml.Serialize(statefulSet);
 
         return WriteResourceFile(updatedResource, chartPath, name, kind);
     }
 
-    private static Task HandleDeployment(V1Deployment deployment, string chartPath, Dictionary<string, string> valuesImages)
+    private static Task HandleDeployment(
+        V1Deployment deployment,
+        string chartPath,
+        Dictionary<string, Dictionary<object, object>> values)
     {
         var metadata = deployment.Metadata;
         var name = metadata.Name;
         var kind = deployment.Kind;
 
-        PopulateValuesImages(deployment.Spec.Template.Spec.Containers, valuesImages, name);
+        PopulateValuesImages(deployment.Spec.Template.Spec.Containers, values, name);
 
         var updatedResource = KubernetesYaml.Serialize(deployment);
 
@@ -102,16 +152,43 @@ public class HelmChartCreator(IFileSystem fileSystem, IKubernetesService kuberne
         return File.WriteAllTextAsync(filename, updatedResource);
     }
 
-    private static void PopulateValuesImages(IEnumerable<V1Container>? containers, IDictionary<string, string> valuesImages, string? name)
+    private static void PopulateValuesImages(
+        IEnumerable<V1Container>? containers,
+        Dictionary<string, Dictionary<object, object>> values,
+        string name)
     {
-        var formattedName = name.Replace("-", "").ToLowerInvariant();
-
+        var formattedName = FormatKebabToCamel(name);
         foreach (var container in containers)
         {
             var image = container.Image;
+            var imageComponents = image.Split(':');
+            if (imageComponents.Length == 0)
+            {
+                throw new Exception("Image not specified");
+            }
 
-            valuesImages[formattedName] = image;
-            container.Image = $"{{{{ .Values.images.{formattedName} }}}}";
+            var imageRepo = imageComponents[0];
+            var imageTag = imageComponents.Length > 1 ? imageComponents[1] : "latest";
+
+            if (!values.TryGetValue(formattedName, out var resourceValues))
+            {
+                resourceValues = [];
+                values[formattedName] = resourceValues;
+            }
+
+            if (!resourceValues.TryGetValue("image", out var imageValuesObj) ||
+                imageValuesObj is not Dictionary<string, string> imageValues)
+            {
+                imageValues = [];
+                resourceValues["image"] = imageValues;
+            }
+
+            imageValues["repository"] = imageRepo;
+            imageValues["tag"] = imageTag;
+            imageValues["pullPolicy"] = imageTag == "latest" ? "Always" : "IfNotPresent";
+
+            container.Image = $"{{{{ .Values.{formattedName}.image.repository }}}}:{{{{ .Values.{formattedName}.image.tag }}}}";
+            container.ImagePullPolicy = $"{{{{ .Values.{formattedName}.image.pullPolicy }}}}";
         }
     }
 
@@ -137,8 +214,63 @@ public class HelmChartCreator(IFileSystem fileSystem, IKubernetesService kuberne
         await File.WriteAllTextAsync(chartFile, yaml);
     }
 
-    private static async Task CreateValuesFile(Dictionary<object, object> values, string chartPath)
+    private static async Task CreateValuesFile(Dictionary<string, Dictionary<object, object>> values, string chartPath)
     {
+        var globalEnvValues = new Dictionary<string, string>();
+
+        foreach (var (resourceName, resourceValues) in values)
+        {
+            if (!resourceValues.TryGetValue("env", out var envValuesObj) ||
+                envValuesObj is not Dictionary<string, string> envValues)
+            {
+                continue;
+            }
+
+            var newData = new Dictionary<string, string>(envValues.Count);
+
+            foreach (var (key, value) in envValues)
+            {
+                if (globalEnvValues.TryGetValue(key, out var globalValue))
+                {
+                    if (globalValue != value)
+                    {
+                        newData[key] = value;
+                    }
+                }
+                else if (values.Where(v => v.Key != resourceName).Any(kvp =>
+                {
+                    if (!kvp.Value.TryGetValue("env", out var otherEnvValuesObj) ||
+                        otherEnvValuesObj is not Dictionary<string, string> otherEnvValues)
+                    {
+                        return false;
+                    }
+
+                    return otherEnvValues.TryGetValue(key, out var otherValue) && otherValue == value;
+                }))
+                {
+                    globalEnvValues[key] = value;
+                }
+                else
+                {
+                    newData[key] = value;
+                }
+            }
+
+            if (newData.Count == 0)
+            {
+                resourceValues.Remove("env");
+            }
+            else
+            {
+                resourceValues["env"] = newData;
+            }
+        }
+
+        values["global"] = new Dictionary<object, object>
+        {
+            ["env"] = globalEnvValues
+        };
+
         var serializer = new SerializerBuilder()
             .WithNamingConvention(CamelCaseNamingConvention.Instance)
             .Build();
@@ -146,5 +278,28 @@ public class HelmChartCreator(IFileSystem fileSystem, IKubernetesService kuberne
         var valuesFile = $"{chartPath}/values.yaml";
         var valuesYaml = serializer.Serialize(values);
         await File.AppendAllTextAsync(valuesFile, valuesYaml);
+    }
+
+    private static string FormatKebabToCamel(string value)
+    {
+        Span<char> newString = stackalloc char[value.Length];
+        var newIndex = 0;
+        for (var i = 0; i < value.Length; i++)
+        {
+            if (value[i] != '-')
+            {
+                newString[newIndex++] = value[i];
+                continue;
+            }
+
+            if (i == value.Length - 1)
+            {
+                break;
+            }
+
+            newString[newIndex++] = !char.IsLower(value[++i]) ? value[i] : char.ToUpperInvariant(value[i]);
+        }
+
+        return newString[..newIndex].ToString();
     }
 }

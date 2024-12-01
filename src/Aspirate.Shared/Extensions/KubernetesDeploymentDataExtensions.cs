@@ -93,6 +93,7 @@ public static class KubernetesDeploymentDataExtensions
             {
                 Name = x.Name,
                 MountPath = x.Target,
+                SubPath = "data"
             }).ToList();
         }
 
@@ -233,7 +234,7 @@ public static class KubernetesDeploymentDataExtensions
                 Ports = data.Ports.Select(x => new V1ServicePort
                 {
                     Port = x.InternalPort,
-                    TargetPort = x.ExternalPort,
+                    TargetPort = x.Name,
                     Name = x.Name
                 }).ToList(),
                 Type = data.ServiceType,
